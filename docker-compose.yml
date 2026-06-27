@@ -1,0 +1,266 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo srvr | nc -w 2 localhost 2181 | grep Mode"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD", "bash", "-c", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic queries.main --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic queries.retry --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic queries.dlq --partitions 1 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic metrics-topic --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --list
+    restart: "no"
+
+  redis-cache:
+    image: redis:alpine
+    container_name: redis-cache
+    command:
+      - redis-server
+      - --maxmemory
+      - ${CACHE_SIZE:-200mb}
+      - --maxmemory-policy
+      - allkeys-${POLICY:-lru}
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # ----------------------------------------------------------------------
+  # Plano de OBSERVABILIDAD nuevo en T3: Elasticsearch + Kibana + Spark
+  # ----------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE 'green|yellow'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.4
+    container_name: kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - XPACK_SECURITY_ENABLED=false
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q available"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  spark-streaming:
+    build: ./spark_streaming
+    container_name: spark-streaming
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - TOPIC_METRICS=metrics-topic
+      - ES_NODES=elasticsearch
+      - ES_PORT=9200
+      - ES_INDEX=${ES_INDEX:-metrics-aggregated}
+      - WINDOW_DURATION=${WINDOW_DURATION:-60 seconds}
+      - SLIDE_DURATION=${SLIDE_DURATION:-30 seconds}
+      - WATERMARK=${WATERMARK:-2 minutes}
+      - TRIGGER_INTERVAL=${TRIGGER_INTERVAL:-10 seconds}
+      - STARTUP_DELAY=${STARTUP_DELAY:-25}
+
+  # ----------------------------------------------------------------------
+  # Servicios de la Tarea 2 (plano de procesamiento de consultas)
+  # ----------------------------------------------------------------------
+  generador-respuestas:
+    build: ./generador_respuestas
+    container_name: generador-respuestas
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DATASET_PATH=/app/data/967_buildings.csv.gz
+      - FAILURE_RATE=${FAILURE_RATE:-0.0}
+      - LATENCY_MS=${LATENCY_MS:-0}
+      - DOWN_AT=${DOWN_AT:--1}
+      - DOWN_DURATION=${DOWN_DURATION:-0}
+    expose:
+      - "5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:5000/health', timeout=2); sys.exit(0)"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  metricas:
+    build: ./metricas
+    container_name: metricas
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis-cache
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - TOPIC_METRICS=metrics-topic
+      - PUBLISH_METRICS=1
+      - CONSUMER_GROUP=${CONSUMER_GROUP:-consumidor-grupo}
+    ports:
+      - "5001:5001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:5001/health', timeout=2); sys.exit(0)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  consumidor:
+    build: ./consumidor
+    restart: on-failure
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      redis-cache:
+        condition: service_healthy
+      generador-respuestas:
+        condition: service_healthy
+      metricas:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - TOPIC_MAIN=queries.main
+      - TOPIC_RETRY=queries.retry
+      - TOPIC_DLQ=queries.dlq
+      - CONSUMER_GROUP=${CONSUMER_GROUP:-consumidor-grupo}
+      - REDIS_HOST=redis-cache
+      - URL_RESPUESTA=http://generador-respuestas:5000
+      - URL_METRICAS=http://metricas:5001
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      - MODE=main
+
+  consumidor-retry:
+    build: ./consumidor
+    container_name: consumidor-retry
+    restart: on-failure
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      redis-cache:
+        condition: service_healthy
+      generador-respuestas:
+        condition: service_healthy
+      metricas:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - TOPIC_MAIN=queries.main
+      - TOPIC_RETRY=queries.retry
+      - TOPIC_DLQ=queries.dlq
+      - CONSUMER_GROUP=${CONSUMER_GROUP:-consumidor-grupo}
+      - REDIS_HOST=redis-cache
+      - URL_RESPUESTA=http://generador-respuestas:5000
+      - URL_METRICAS=http://metricas:5001
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      - RETRY_BACKOFF_MS=${RETRY_BACKOFF_MS:-500}
+      - MODE=retry
+      - CONSUMER_ID=retry-1
+
+  generador-trafico:
+    build: ./generador_trafico
+    container_name: generador-trafico
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      metricas:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - TOPIC_MAIN=queries.main
+      - URL_METRICAS=http://metricas:5001
+      - DIST=${DIST:-zipf}
+      - N_CONSULTAS=${N_CONSULTAS:-1000}
+      - RATE=${RATE:-50}
+      - SPIKE=${SPIKE:-0}
+      - SPIKE_FACTOR=${SPIKE_FACTOR:-10}
+      - SPIKE_AT=${SPIKE_AT:-0.5}
+      - SPIKE_DURATION=${SPIKE_DURATION:-5}

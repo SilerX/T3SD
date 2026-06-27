@@ -1,0 +1,28 @@
+{
+  "index_patterns": ["metrics-aggregated*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "window_start":       { "type": "date" },
+        "window_end":         { "type": "date" },
+        "ingested_at":        { "type": "date" },
+        "total_events":       { "type": "long" },
+        "ok_events":          { "type": "long" },
+        "hit_events":         { "type": "long" },
+        "miss_ok_events":     { "type": "long" },
+        "retry_events":       { "type": "long" },
+        "dlq_count":          { "type": "long" },
+        "throughput_per_min": { "type": "double" },
+        "latency_p50_ms":     { "type": "double" },
+        "latency_p95_ms":     { "type": "double" },
+        "hit_rate":           { "type": "double" },
+        "retry_rate":         { "type": "double" },
+        "doc_id":             { "type": "keyword" }
+      }
+    }
+  }
+}
