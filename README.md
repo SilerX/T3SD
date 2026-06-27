@@ -106,8 +106,3 @@ python3 scripts/measure_viz_latency.py --out resultados/viz_latency.csv
 - Métricas (API): 5001 (`/stats`, `/backlog`, `/raw`)
 - Elasticsearch: 9200
 - Kibana: 5601
-
-## Informe y video
-
-- `informe_T3SD.tex` — informe LaTeX (compilar con `pdflatex` 2 veces).
-- `guion_video_T3SD.md` — guion del video de demostración (~15 min).
